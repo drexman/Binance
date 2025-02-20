@@ -9,3 +9,5 @@ pip install matplotlib
 pip install finplot
 pip install yfinance
 pip install plotly
+pip install mplfinance
+

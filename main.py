@@ -3,8 +3,9 @@ import pandas as pd
 import time
 from datetime import datetime
 import matplotlib.pyplot as plt
-import finplot as fplt
-import plotly.graph_objects as go
+import matplotlib.animation as animation
+import mplfinance as mpf
+from lightweight_charts import Chart
 from binance.client import Client
 
 
@@ -17,6 +18,14 @@ logging.basicConfig(
     filename="src/logs/trading_bot.log",
     format='%(asctime)s %(clientip)-15s %(user)-8s %(message)s'
 )
+
+FATOR_VOLATILITY = 0.3
+ACCEPTABLE_LOSS_PERCENTAGE = 0
+STOP_LOSS_PERCENTAGE = 3
+FALLBACK_ACTIVATED  = True
+
+DELAY_ENTRE_ORDENS = 15 * 60
+
 
 class BinanceTrader():
 
@@ -32,8 +41,9 @@ class BinanceTrader():
         self.cliente_binance = Client(API_KEY, secret_key) # Inicia o cliente da Binance
 
         #self.updateAllData()
-        self.updateCloseOpenTime()
+        #self.updateCloseOpenTime()
         print('Robo iniciando...')
+     
 
     def updateAllData(self):
         self.account_data = self.getAccount()
@@ -54,42 +64,80 @@ class BinanceTrader():
     def getActualTradePosition(self):
         return self.last_stock_account_balance > 0.001
     
-    def getStockDataDay_ClosePrice_OpenTime(self) :
-        candles = self.cliente_binance.get_klines(symbol=self.operation_code, interval=self.candle_period, limit=100) 
+    def getStockDataDay_ClosePrice_OpenTime(self, limit) :
+        
+        candles = self.cliente_binance.get_klines(symbol=self.operation_code, interval=self.candle_period, limit=limit) 
 
-        indexes = ['Open Time', 'Open', 'High','Low', 'Close', 'Volume', 'Close Time', 'QAV', 'No. Trades', 'Taker BBAV', 'Taker BQAV', 'Ignore']
+        indexes = ['date', 'open', 'high','low', 'close', 'volume', 'close date', 'qav', 'No. Trades', 'Taker BBAV', 'Taker BQAV', 'Ignore']
         data = pd.DataFrame(columns=indexes,data=candles)
         # Transforma um DataFrame Pandas
 
-        data["Open Time"] = pd.to_datetime(data["Open Time"], unit = "ms").dt.tz_localize("UTC")
-        data["Open Time"] = data["Open Time"].dt.tz_convert("America/Sao_Paulo")
+        data['volatility'] = data['close'].rolling(window=40).std()
 
-        #data["Close Time"] = pd.to_datetime(data["Close Time"], unit = "ms").dt.tz_localize("UTC")
-        #data["Close Time"] = data["Close Time"].dt.tz_convert("America/Sao_Paulo")
 
-        data['Open'] = pd.to_numeric(data['Open'])
-        data['High'] = pd.to_numeric(data['High'])
-        data['Low'] = pd.to_numeric(data['Low'])
-        data['Close'] = pd.to_numeric(data['Close'])
+        # Calculate the 12 period EMA
+        data["EMA12"] = data["close"].ewm(span=12, adjust=False).mean()
+        # Calculate the 26-period EMA
+        data['EMA26'] = data['close'].ewm(span=26, adjust=False).mean()
 
-        print(data[['Open', 'High', 'Low', 'Close']].values)
+        last_mv_fast = data["EMA12"].iloc[-1]
+        prev_mv_fast = data["EMA12"].iloc[-3]
 
-        fig = go.Figure(data=[go.Candlestick(x=data['Open Time'], open=data['Open'],high=data['High'],low=data['Low'], close=data['Close'])])
-        fig.show()
+        last_mv_slow = data["EMA26"].iloc[-1]
+        prev_mv_slow = data["EMA26"].iloc[-3]
 
-     
+        fast_gradient = last_mv_fast - prev_mv_fast
+        slow_gradient = last_mv_slow - prev_mv_slow
 
-    def getStockData_ClosePrice_OpenTime(self):
-        candles = self.cliente_binance.get_klines(symbol = self.operation_code, interval = self.candle_period, limit = 100)
+        current_diff = abs(last_mv_fast - last_mv_slow)
 
-        indexes = ['Open Time', 'Open', 'High','Low', 'Close', 'Volume', 'Close Time', 'QAV', 'No. Trades', 'Taker BBAV', 'Taker BQAV', 'Ignore']
-        data = pd.DataFrame(columns=indexes,data=candles)
-        # Transforma um DataFrame Pandas
-        data["Open Time"] = pd.to_datetime(data["open_time"], unit = "ms").dt.tz_localize("UTC")
-        data["Open Time"] = data["open_time"].dt.tz_convert("America/Sao_Paulo")
+        ma_trade_decision = None 
 
+        # Calculate MACD (the difference between 12-period EMA and 26-period EMA)
+        data['MACD'] = data['EMA12'] - data['EMA26']
+
+        # Calculate the 9-period EMA of MACD (Signal Line)
+        data['Signal_Line'] = data['MACD'].ewm(span=9, adjust=False).mean()
+        data['Histogram'] = data['MACD'] -  data['Signal_Line']
+
+        data["date"] = pd.to_datetime(data["date"], unit = "ms")
+
+        numeric_columns = ['open', 'high', 'low', 'close', 'volume']
+        data[numeric_columns] = data[numeric_columns].apply(pd.to_numeric, axis=1)
+       
         return data
 
+    def getCalculoMedia(self, data):
+
+        # Calculate the 12 period EMA
+        data["EMA12"] = data["close"].ewm(span=12, adjust=False).mean()
+        # Calculate the 26-period EMA
+        data['EMA26'] = data['close'].ewm(span=26, adjust=False).mean()
+
+        last_mv_fast = data["EMA12"].iloc[-1]
+        prev_mv_fast = data["EMA12"].iloc[-3]
+
+        last_mv_slow = data["EMA26"].iloc[-1]
+        prev_mv_slow = data["EMA26"].iloc[-3]
+
+        last_volatility = data['volatility'].iloc[-2]
+
+        fast_gradient = last_mv_fast - prev_mv_fast
+        slow_gradient = last_mv_slow - prev_mv_slow
+
+        current_diff = abs(last_mv_fast - last_mv_slow)
+
+        ma_trade_decision = None 
+
+        if current_diff < last_volatility * FATOR_VOLATILITY:
+
+            if fast_gradient > 0 and fast_gradient > slow_gradient:
+                ma_trade_decision = True
+            elif fast_gradient < 0 and fast_gradient < slow_gradient:
+                ma_trade_decision = False
+                
+
+        return ''
     def getMovingAverageTraderStrategy(self, fast_window = 7, slow_window = 40):
 
         #Calcular as médias moveis rápida e lenta
@@ -110,10 +158,22 @@ class BinanceTrader():
         print('Estratégia executada: Moving Average')
         print(f'({self.operation_code})\n | {last_ma_fast:.3f} = última média rapido\n | {last_ma_slow:.3f}')
 
+    def generate_new_candlestick(self):
+        candles = self.cliente_binance.get_klines(symbol=self.operation_code, interval=self.candle_period, limit=1)
+        indexes = ['time', 'open', 'high','low', 'close', 'volume', 'close date', 'QAV', 'No. Trades', 'Taker BBAV', 'Taker BQAV', 'Ignore']
+        data = pd.DataFrame(columns=indexes,data=candles)
+
+        # Transforma um DataFrame Pandas
+        data["time"] = pd.to_datetime(data["time"], unit = "ms")
+        
+        numeric_columns = ['open', 'high', 'low', 'close', 'volume']
+        data[numeric_columns] = data[numeric_columns].apply(pd.to_numeric, axis=1)
+        
+        return data.set_index('date', inplace=True)
+
     def getAccount(self):
         return self.cliente_binance.get_account()
     
-
     def get_current_price(self):
         ticker = self.cliente_binance.get_symbol_ticker(symbol=self.operation_code)
         return float(ticker['price'])
@@ -125,11 +185,42 @@ class BinanceTrader():
         order = self.cliente_binance.order_market_sell(symbol=self.operation_code, quantity = self.trader_quantity)
         print(f'Ordem de venda executado {order}')
 
-    def execute(self):
-        self.updateCloseOpenTime()
-        
-traderBot =  BinanceTrader('BTC','BTCUSDT', 0.001, 100, condle_period_15minutes) 
 
-while True:
-    traderBot.execute()
-    time.sleep(15)
+def calculate_sma(df, period: int = 50):
+    return pd.DataFrame({
+        'time': df['date'],
+        f'SMA {period}': df['close'].rolling(window=period).mean()
+    }).dropna()
+
+if __name__ == '__main__':
+    traderBot =  BinanceTrader('BTC','BTCUSDT', 0.001, 100, condle_period_15minutes) 
+    data = traderBot.getStockDataDay_ClosePrice_OpenTime(100)
+    chart = Chart(toolbox=True)
+    chart.grid(vert_enabled = True, horz_enabled = True)
+    chart.topbar.textbox('symbol', 'BTC')
+
+    chart.legend(visible = True, font_family = 'Trebuchet MS', ohlc = True, percent = True)
+    chart.fit()
+    chart.set(data)
+    signal_line = chart.create_line(color = '#ffeb3b')
+    sl = pd.DataFrame(columns = ['time','value'])
+    sl.time = data['date']
+    sl.value = data['EMA12']
+    signal_line.set(sl)
+
+    macd_line = chart.create_line(color = '#088F8F')
+    macd = pd.DataFrame(columns = ['time','value'])
+    macd.time = data['date']
+    macd.value = data['EMA26']
+    macd_line.set(macd)
+
+    chart.show()
+
+    try:
+        while True:
+            newCandle = traderBot.getStockDataDay_ClosePrice_OpenTime(1)
+            for index, series in newCandle.iterrows():
+                chart.update(series)
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print('interrupted')
